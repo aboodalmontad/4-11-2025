@@ -19,6 +19,7 @@ interface UseSyncProps {
     isOnline: boolean;
     isAuthLoading: boolean;
     syncStatus: SyncStatus;
+    locallyDeletedDocIds: Set<string>; // New prop to track locally deleted docs
 }
 
 const flattenData = (data: AppData): FlatData => {
@@ -168,30 +169,8 @@ const applyDeletionsToLocal = (localFlatData: FlatData, deletions: SyncDeletion[
     filteredInvoiceItems = filteredInvoiceItems.filter(i => invoiceIds.has(i.invoice_id));
     
     // Documents depend on Cases
-    // Special handling for documents: If deleted remotely but we have the file, convert to local-only
-    let filteredDocs = localFlatData.case_documents.map(doc => {
-        const id = doc.id;
-        const key = `case_documents:${id}`;
-        const deletedAtStr = deletionMap.get(key);
-
-        if (deletedAtStr) {
-            const deletedAt = new Date(deletedAtStr).getTime();
-            const updatedAt = new Date(doc.updated_at || 0).getTime();
-            
-            // If deleted remotely after our local update
-            if (updatedAt < (deletedAt + 2000)) {
-                // If we have the file locally (synced or already local-only), keep it but mark as local only
-                if (doc.localState === 'synced' || doc.isLocalOnly) {
-                    return { ...doc, isLocalOnly: true };
-                }
-                // Otherwise (e.g. pending_download), it's safe to remove as we can't get it anymore
-                return null;
-            }
-        }
-        return doc;
-    }).filter(doc => doc !== null); // Filter out the nulls (truly deleted docs)
-
-    // Apply cascading delete if parent Case is gone (regardless of file status, orphan docs are usually bad)
+    // NOTE: Documents are handled specially later for local-only retention
+    let filteredDocs = filterItems(localFlatData.case_documents, 'case_documents');
     filteredDocs = filteredDocs.filter(d => caseIds.has(d.caseId)); 
     
     // Accounting Entries depend on Clients
@@ -218,7 +197,7 @@ const applyDeletionsToLocal = (localFlatData: FlatData, deletions: SyncDeletion[
 };
 
 
-export const useSync = ({ user, localData, deletedIds, onDataSynced, onDeletionsSynced, onSyncStatusChange, isOnline, isAuthLoading, syncStatus }: UseSyncProps) => {
+export const useSync = ({ user, localData, deletedIds, onDataSynced, onDeletionsSynced, onSyncStatusChange, isOnline, isAuthLoading, syncStatus, locallyDeletedDocIds }: UseSyncProps) => {
     const userRef = React.useRef(user);
     userRef.current = user;
 
@@ -307,9 +286,7 @@ export const useSync = ({ user, localData, deletedIds, onDataSynced, onDeletions
                         } else { finalMergedItems.set(id, remoteItem); }
                     } else {
                         // Special Handling for Documents: 
-                        // If it's local but missing remote, AND not in deleted list, AND it was synced before -> it was auto-cleaned or deleted remotely.
-                        // Logic in applyDeletionsToLocal handles the explicit deletion case. 
-                        // This block handles the case where it's just "missing" from remote (maybe auto-cleaned).
+                        // If it's local but missing remote, AND not in deleted list, AND it was synced before -> it was auto-cleaned.
                         if (key === 'case_documents' && localItem.localState === 'synced' && !deletedIdsSets.documents.has(id)) {
                              // Mark as local-only, do NOT upsert to bring it back to cloud
                              const localOnlyDoc = { ...localItem, isLocalOnly: true };
@@ -329,6 +306,12 @@ export const useSync = ({ user, localData, deletedIds, onDataSynced, onDeletions
                         const entityKey = key === 'admin_tasks' ? 'adminTasks' : key === 'accounting_entries' ? 'accountingEntries' : key === 'invoice_items' ? 'invoiceItems' : key === 'case_documents' ? 'documents' : key === 'site_finances' ? 'siteFinances' : key;
                         const deletedSet = (deletedIdsSets as any)[entityKey];
                         if (deletedSet) isDeleted = deletedSet.has(id);
+                        
+                        // NEW: Ignore if deleted locally (prevent resurrection of local deleted docs)
+                        if (key === 'case_documents' && locallyDeletedDocIds.has(id)) {
+                            isDeleted = true;
+                        }
+
                         if (!isDeleted) finalMergedItems.set(id, remoteItem);
                     }
                 }
@@ -433,7 +416,7 @@ export const useSync = ({ user, localData, deletedIds, onDataSynced, onDeletions
             if (err.table) errorMessage = `[جدول: ${err.table}] ${errorMessage}`;
             setStatus('error', `فشل المزامنة: ${errorMessage}`);
         }
-    }, [localData, userRef, isOnline, onDataSynced, deletedIds, onDeletionsSynced, isAuthLoading, syncStatus]);
+    }, [localData, userRef, isOnline, onDataSynced, deletedIds, onDeletionsSynced, isAuthLoading, syncStatus, locallyDeletedDocIds]);
 
     const fetchAndRefresh = React.useCallback(async () => {
         if (syncStatus === 'syncing' || isAuthLoading) return;
@@ -460,9 +443,20 @@ export const useSync = ({ user, localData, deletedIds, onDataSynced, onDeletions
             for (const key of Object.keys(remoteFlatDataUntyped) as (keyof FlatData)[]) {
                 const entityKey = key === 'admin_tasks' ? 'adminTasks' : key === 'accounting_entries' ? 'accountingEntries' : key === 'invoice_items' ? 'invoiceItems' : key === 'case_documents' ? 'documents' : key === 'site_finances' ? 'siteFinances' : key;
                 const deletedSet = (deletedIdsSets as any)[entityKey];
+                
+                let filteredItems = ((remoteFlatDataUntyped as any)[key] || []);
+                
+                // Filter items that are pending deletion globally
                 if (deletedSet && deletedSet.size > 0) {
-                    (remoteFlatData as any)[key] = ((remoteFlatDataUntyped as any)[key] || []).filter((item: any) => !deletedSet.has(item.id ?? item.name));
-                } else { (remoteFlatData as any)[key] = (remoteFlatDataUntyped as any)[key]; }
+                    filteredItems = filteredItems.filter((item: any) => !deletedSet.has(item.id ?? item.name));
+                }
+                
+                // NEW: Filter items that are deleted locally (prevent resurrection)
+                if (key === 'case_documents') {
+                    filteredItems = filteredItems.filter((item: any) => !locallyDeletedDocIds.has(item.id));
+                }
+
+                (remoteFlatData as any)[key] = filteredItems;
             }
     
             let localFlatData = flattenData(localData);
@@ -496,7 +490,7 @@ export const useSync = ({ user, localData, deletedIds, onDataSynced, onDeletions
             else console.error("Error during realtime refresh:", err);
             setStatus('error', `فشل تحديث البيانات: ${errorMessage}`);
         }
-    }, [localData, deletedIds, userRef, isOnline, onDataSynced, isAuthLoading, syncStatus]);
+    }, [localData, deletedIds, userRef, isOnline, onDataSynced, isAuthLoading, syncStatus, locallyDeletedDocIds]);
 
     return { manualSync, fetchAndRefresh };
 };

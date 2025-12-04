@@ -20,6 +20,7 @@ const DB_VERSION = 11;
 const DATA_STORE_NAME = 'appData';
 const DOCS_FILES_STORE_NAME = 'caseDocumentFiles';
 const DOCS_METADATA_STORE_NAME = 'caseDocumentMetadata';
+const LOCALLY_DELETED_DOCS_KEY = 'lawyer_app_locally_deleted_docs';
 
 // --- User Settings Management ---
 interface UserSettings {
@@ -293,6 +294,15 @@ export const useSupabaseData = (user: User | null, isAuthLoading: boolean) => {
     const [userSettings, setUserSettings] = React.useState<any>({ isAutoSyncEnabled: true, isAutoBackupEnabled: true, adminTasksLayout: 'horizontal', locationOrder: [] });
     const isOnline = useOnlineStatus();
     
+    // Track locally deleted documents to prevent resurrection
+    const [locallyDeletedDocIds, setLocallyDeletedDocIds] = React.useState<Set<string>>(() => {
+        if (typeof localStorage === 'undefined') return new Set();
+        try {
+            const stored = localStorage.getItem(LOCALLY_DELETED_DOCS_KEY);
+            return stored ? new Set(JSON.parse(stored)) : new Set();
+        } catch { return new Set(); }
+    });
+    
     const userRef = React.useRef(user);
     userRef.current = user;
     const prevProfilesRef = React.useRef<Profile[]>([]);
@@ -526,7 +536,8 @@ export const useSupabaseData = (user: User | null, isAuthLoading: boolean) => {
         onDataSynced: handleDataSynced,
         onDeletionsSynced: handleDeletionsSynced,
         onSyncStatusChange: handleSyncStatusChange,
-        isOnline, isAuthLoading, syncStatus
+        isOnline, isAuthLoading, syncStatus,
+        locallyDeletedDocIds // Pass local deletion list
     });
 
     // Process Upload Queue
@@ -581,12 +592,55 @@ export const useSupabaseData = (user: User | null, isAuthLoading: boolean) => {
         }
     }, [isOnline, updateData]);
 
-    // Trigger upload queue processing when online or documents change
+    // Process Download Queue (Automatically download new files)
+    const processDownloadQueue = React.useCallback(async () => {
+        if (!isOnline) return;
+        const db = await getDb();
+        
+        // Find documents that are pending download from the current STATE
+        // We use state 'data.documents' because it reflects the latest synced data
+        const pendingDownloads = data.documents.filter(d => d.localState === 'pending_download' && !d.isLocalOnly);
+        
+        if (pendingDownloads.length === 0) return;
+        console.log(`Auto-downloading ${pendingDownloads.length} files...`);
+
+        const supabase = getSupabaseClient();
+        if (!supabase) return;
+
+        for (const doc of pendingDownloads) {
+            try {
+                // Update UI to downloading
+                updateData(p => ({...p, documents: p.documents.map(d => d.id === doc.id ? {...d, localState: 'downloading' } : d)}));
+                
+                const { data: blob, error } = await supabase.storage.from('documents').download(doc.storagePath);
+                
+                if (error) throw error;
+                
+                if (blob) {
+                    const downloadedFile = new File([blob], doc.name, { type: doc.type });
+                    await db.put(DOCS_FILES_STORE_NAME, downloadedFile, doc.id);
+                    // Update Metadata
+                    const updatedDoc = { ...doc, localState: 'synced' };
+                    await db.put(DOCS_METADATA_STORE_NAME, updatedDoc, doc.id);
+                    // Update UI
+                    updateData(p => ({...p, documents: p.documents.map(d => d.id === doc.id ? {...d, localState: 'synced'} : d)}));
+                }
+            } catch (e) {
+                console.error("Auto-download failed", e);
+                // If failed, mark as error or leave pending? 
+                // Using 'error' alerts the user in the UI
+                updateData(p => ({...p, documents: p.documents.map(d => d.id === doc.id ? {...d, localState: 'error'} : d)}));
+            }
+        }
+    }, [isOnline, data.documents, updateData]);
+
+    // Trigger queues
     React.useEffect(() => {
         if (isOnline) {
             processUploadQueue();
+            processDownloadQueue();
         }
-    }, [isOnline, processUploadQueue, data.documents]);
+    }, [isOnline, processUploadQueue, processDownloadQueue, data.documents]);
 
     // Auto Sync
     React.useEffect(() => {
@@ -679,18 +733,27 @@ export const useSupabaseData = (user: User | null, isAuthLoading: boolean) => {
         deleteAccountingEntry: (id: string) => { updateData(p => ({...p, accountingEntries: p.accountingEntries.filter(e => e.id !== id)})); createDeleteFunction('accountingEntries')(id); },
         deleteInvoice: (id: string) => { updateData(p => ({...p, invoices: p.invoices.filter(i => i.id !== id)})); createDeleteFunction('invoices')(id); },
         deleteAssistant: (name: string) => { updateData(p => ({...p, assistants: p.assistants.filter(a => a !== name)})); createDeleteFunction('assistants')(name); },
+        
+        // MODIFIED: Local Only Delete
         deleteDocument: async (doc: CaseDocument) => {
-            // ...
             const db = await getDb();
+            // 1. Remove from local storage (IDB)
             await db.delete(DOCS_FILES_STORE_NAME, doc.id);
             await db.delete(DOCS_METADATA_STORE_NAME, doc.id);
+            
+            // 2. Remove from React State
             updateData(p => ({ ...p, documents: p.documents.filter(d => d.id !== doc.id) }));
-            if(effectiveUserId && !doc.isLocalOnly) { // Only send delete if it wasn't already local-only
-                const newDeletedIds = { ...deletedIds, documents: [...deletedIds.documents, doc.id], documentPaths: [...deletedIds.documentPaths, doc.storagePath] };
-                setDeletedIds(newDeletedIds);
-                await db.put(DATA_STORE_NAME, newDeletedIds, `deletedIds_${effectiveUserId}`);
-            }
+            
+            // 3. Mark as locally deleted to prevent sync resurrection
+            const newSet = new Set(locallyDeletedDocIds);
+            newSet.add(doc.id);
+            setLocallyDeletedDocIds(newSet);
+            localStorage.setItem(LOCALLY_DELETED_DOCS_KEY, JSON.stringify(Array.from(newSet)));
+            
+            // 4. DO NOT send to global delete list (deletedIds)
+            // This ensures other devices keep their copy
         },
+        
         // ... (addDocuments, getDocumentFile, postponeSession - ensure they call updateData which handles IDB key)
         addDocuments: async (caseId: string, files: FileList) => {
              const db = await getDb();
