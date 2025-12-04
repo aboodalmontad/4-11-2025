@@ -529,6 +529,43 @@ export const useSupabaseData = (user: User | null, isAuthLoading: boolean) => {
         isOnline, isAuthLoading, syncStatus
     });
 
+    // Helper functions for document handling
+    const getDocumentFile = React.useCallback(async (docId: string): Promise<File | null> => {
+        const db = await getDb();
+        const supabase = getSupabaseClient();
+        const doc = data.documents.find(d => d.id === docId);
+        if (!doc) return null;
+        
+        // 1. Try Local
+        const localFile = await db.get(DOCS_FILES_STORE_NAME, docId);
+        if (localFile) return localFile;
+        
+        // Cannot download if it's local only and file is missing (shouldn't happen unless user cleared cache)
+        if (doc.isLocalOnly) return null;
+
+        // 2. Try Download
+        if (doc.localState === 'pending_download' && isOnline && supabase) {
+            try {
+                updateData(p => ({...p, documents: p.documents.map(d => d.id === docId ? {...d, localState: 'downloading' } : d)}));
+                const { data: blob, error } = await supabase.storage.from('documents').download(doc.storagePath);
+                if (error || !blob) {
+                    const errMsg = error?.message || "Empty blob received";
+                    console.error(`Download failed for ${doc.name}:`, errMsg);
+                    throw new Error(errMsg);
+                }
+                const downloadedFile = new File([blob], doc.name, { type: doc.type });
+                await db.put(DOCS_FILES_STORE_NAME, downloadedFile, doc.id);
+                await db.put(DOCS_METADATA_STORE_NAME, { ...doc, localState: 'synced' }, doc.id);
+                updateData(p => ({...p, documents: p.documents.map(d => d.id === docId ? {...d, localState: 'synced'} : d)}));
+                return downloadedFile;
+            } catch (e: any) {
+                await db.put(DOCS_METADATA_STORE_NAME, { ...doc, localState: 'error' }, doc.id);
+                updateData(p => ({...p, documents: p.documents.map(d => d.id === docId ? {...d, localState: 'error'} : d)}));
+            }
+        }
+        return null;
+    }, [data.documents, isOnline, updateData]);
+
     // Process Upload Queue
     const processUploadQueue = React.useCallback(async () => {
         if (!isOnline) return;
@@ -581,12 +618,38 @@ export const useSupabaseData = (user: User | null, isAuthLoading: boolean) => {
         }
     }, [isOnline, updateData]);
 
-    // Trigger upload queue processing when online or documents change
+    // Process Download Queue (Auto Download)
+    const processDownloadQueue = React.useCallback(async () => {
+        if (!isOnline) return;
+
+        // Find documents that need downloading
+        const pendingDownloads = data.documents.filter(doc => 
+            doc.localState === 'pending_download' && !doc.isLocalOnly
+        );
+
+        if (pendingDownloads.length === 0) return;
+
+        console.log(`Processing ${pendingDownloads.length} file downloads...`);
+
+        // We use a simple loop. getDocumentFile handles state updates.
+        // It's important that we don't trigger too many requests at once if the list is huge,
+        // but for now sequential is safer.
+        for (const doc of pendingDownloads) {
+            try {
+                await getDocumentFile(doc.id);
+            } catch (err) {
+                console.error(`Auto-download failed for ${doc.name}:`, err);
+            }
+        }
+    }, [isOnline, data.documents, getDocumentFile]);
+
+    // Trigger queues processing
     React.useEffect(() => {
         if (isOnline) {
             processUploadQueue();
+            processDownloadQueue();
         }
-    }, [isOnline, processUploadQueue, data.documents]);
+    }, [isOnline, processUploadQueue, processDownloadQueue, data.documents]);
 
     // Auto Sync
     React.useEffect(() => {
@@ -691,7 +754,6 @@ export const useSupabaseData = (user: User | null, isAuthLoading: boolean) => {
                 await db.put(DATA_STORE_NAME, newDeletedIds, `deletedIds_${effectiveUserId}`);
             }
         },
-        // ... (addDocuments, getDocumentFile, postponeSession - ensure they call updateData which handles IDB key)
         addDocuments: async (caseId: string, files: FileList) => {
              const db = await getDb();
              const newDocs: CaseDocument[] = [];
@@ -710,39 +772,7 @@ export const useSupabaseData = (user: User | null, isAuthLoading: boolean) => {
              }
              updateData(p => ({...p, documents: [...p.documents, ...newDocs]}));
         },
-        getDocumentFile: async (docId: string): Promise<File | null> => {
-            const db = await getDb();
-            const supabase = getSupabaseClient();
-            const doc = data.documents.find(d => d.id === docId);
-            if (!doc) return null;
-            const localFile = await db.get(DOCS_FILES_STORE_NAME, docId);
-            if (localFile) return localFile;
-            
-            // Cannot download if it's local only and file is missing (shouldn't happen unless user cleared cache)
-            if (doc.isLocalOnly) return null;
-
-            if (doc.localState === 'pending_download' && isOnline && supabase) {
-                try {
-                    updateData(p => ({...p, documents: p.documents.map(d => d.id === docId ? {...d, localState: 'downloading' } : d)}));
-                    const { data: blob, error } = await supabase.storage.from('documents').download(doc.storagePath);
-                    if (error || !blob) {
-                        const errMsg = error?.message || "Empty blob received";
-                        console.error(`Download failed for ${doc.name}:`, errMsg);
-                        throw new Error(errMsg);
-                    }
-                    const downloadedFile = new File([blob], doc.name, { type: doc.type });
-                    await db.put(DOCS_FILES_STORE_NAME, downloadedFile, doc.id);
-                    await db.put(DOCS_METADATA_STORE_NAME, { ...doc, localState: 'synced' }, doc.id);
-                    updateData(p => ({...p, documents: p.documents.map(d => d.id === docId ? {...d, localState: 'synced'} : d)}));
-                    return downloadedFile;
-                } catch (e: any) {
-                    await db.put(DOCS_METADATA_STORE_NAME, { ...doc, localState: 'error' }, doc.id);
-                    updateData(p => ({...p, documents: p.documents.map(d => d.id === docId ? {...d, localState: 'error'} : d)}));
-                    // Optional: You could expose this error to the UI via a toast if needed
-                }
-            }
-            return null;
-        },
+        getDocumentFile, // Exported
         postponeSession: (sessionId: string, newDate: Date, newReason: string) => {
              updateData(prev => {
                  // ... (postpone logic from previous version, unchanged)

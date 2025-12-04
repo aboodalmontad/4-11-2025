@@ -4,6 +4,7 @@ import { useData } from '../context/DataContext';
 import { CaseDocument } from '../types';
 import { DocumentArrowUpIcon, TrashIcon, EyeIcon, DocumentTextIcon, PhotoIcon, XMarkIcon, ExclamationTriangleIcon, ArrowPathIcon, CameraIcon, CloudArrowUpIcon, CloudArrowDownIcon, CheckCircleIcon, ExclamationCircleIcon, ArrowDownTrayIcon, ServerIcon } from './icons';
 import { renderAsync } from 'docx-preview';
+import { useOnlineStatus } from '../hooks/useOnlineStatus';
 
 interface CaseDocumentsProps {
     caseId: string;
@@ -200,34 +201,54 @@ const PreviewModal: React.FC<{ doc: CaseDocument; onClose: () => void }> = ({ do
     const [objectUrl, setObjectUrl] = React.useState<string | null>(null);
     const [error, setError] = React.useState<string | null>(null);
     const [isLoading, setIsLoading] = React.useState(true);
-
-    // Get the latest doc state from context, in case it was updated by a download
-    const currentDoc = documents.find(d => d.id === doc.id) || doc;
+    const isOnline = useOnlineStatus();
 
     React.useEffect(() => {
         let url: string | null = null;
+        let retryTimeout: number | null = null;
+
         const loadFile = async () => {
             setIsLoading(true);
             setError(null);
+            
+            // Re-fetch latest doc state from context
+            const latestDoc = documents.find(d => d.id === doc.id) || doc;
+
             try {
-                // getDocumentFile now handles downloading and updates state internally
+                // getDocumentFile handles downloading and updates state internally
                 const retrievedFile = await getDocumentFile(doc.id);
                 
                 if (retrievedFile) {
                     setFile(retrievedFile);
                     url = URL.createObjectURL(retrievedFile);
                     setObjectUrl(url);
+                    setIsLoading(false);
                 } else {
-                    const latestDocState = documents.find(d => d.id === doc.id)?.localState;
-                    if (latestDocState === 'error') {
-                        setError('فشل تنزيل الملف. يرجى التحقق من اتصالك بالإنترنت والتأكد من تطبيق صلاحيات التخزين (Storage Policies) بشكل صحيح في لوحة تحكم Supabase.');
+                    // File not in IDB yet. Check state for feedback loop.
+                    if (latestDoc.localState === 'downloading') {
+                        // It's in the background queue. Retry in 1s.
+                        retryTimeout = window.setTimeout(loadFile, 1000);
+                        // Keep loading true
+                    } else if (latestDoc.localState === 'error') {
+                        setError('فشل تنزيل الملف. يرجى التحقق من اتصالك بالإنترنت والتأكد من تطبيق صلاحيات التخزين.');
+                        setIsLoading(false);
+                    } else if (latestDoc.localState === 'pending_download') {
+                         if (!isOnline) {
+                             setError('الملف غير متوفر محلياً. يرجى الاتصال بالإنترنت لتنزيله.');
+                             setIsLoading(false);
+                         } else {
+                             // Should have been triggered, but maybe failed silently or queue is full?
+                             // Retry explicitly
+                             retryTimeout = window.setTimeout(loadFile, 2000);
+                         }
                     } else {
-                        setError('الملف غير متوفر محلياً. حاول مرة أخرى عند توفر اتصال بالإنترنت لتنزيله.');
+                        // isLocalOnly or lost
+                        setError('الملف غير متوفر.');
+                        setIsLoading(false);
                     }
                 }
             } catch (e: any) {
                 setError('حدث خطأ غير متوقع: ' + e.message);
-            } finally {
                 setIsLoading(false);
             }
         };
@@ -235,11 +256,10 @@ const PreviewModal: React.FC<{ doc: CaseDocument; onClose: () => void }> = ({ do
         loadFile();
             
         return () => {
-            if (url) {
-                URL.revokeObjectURL(url);
-            }
+            if (url) URL.revokeObjectURL(url);
+            if (retryTimeout) clearTimeout(retryTimeout);
         };
-    }, [doc.id, getDocumentFile]);
+    }, [doc.id, getDocumentFile, documents, isOnline]);
 
 
     const handleDownload = () => {
@@ -254,17 +274,18 @@ const PreviewModal: React.FC<{ doc: CaseDocument; onClose: () => void }> = ({ do
     };
 
     const renderPreview = () => {
-        if (!file || !objectUrl) return null;
-        
         // Show a loading indicator if the file is currently being downloaded
-        if (currentDoc.localState === 'downloading') {
-            return (
+        // This is handled by isLoading state now which waits for the file
+        if (isLoading) {
+             return (
                 <div className="flex flex-col items-center justify-center h-full">
                     <CloudArrowDownIcon className="w-12 h-12 text-blue-500 animate-spin mb-4" />
-                    <p className="text-gray-700">جاري تنزيل الملف...</p>
+                    <p className="text-gray-700">جاري تحميل الملف...</p>
                 </div>
             );
         }
+
+        if (!file || !objectUrl) return null;
 
         if (file.type.startsWith('image/')) return <img src={objectUrl} alt={doc.name} className="max-h-full max-w-full object-contain mx-auto" />;
         if (file.type.startsWith('text/')) return <TextPreview file={file} name={doc.name} />;
@@ -287,9 +308,23 @@ const PreviewModal: React.FC<{ doc: CaseDocument; onClose: () => void }> = ({ do
     return (
         <div className="fixed inset-0 bg-black bg-opacity-60 flex items-center justify-center z-50 p-4" onClick={onClose}>
             <div className="bg-white rounded-lg shadow-xl w-full h-full max-w-4xl max-h-[90vh] flex flex-col" onClick={e => e.stopPropagation()}>
-                {isLoading && <div className="flex items-center justify-center h-full"><ArrowPathIcon className="w-8 h-8 animate-spin text-blue-500" /></div>}
-                {error && <div className="flex flex-col items-center justify-center h-full p-4"><ExclamationTriangleIcon className="w-10 h-10 text-red-500 mb-4"/><p className="text-red-700 text-center">{error}</p></div>}
-                {!isLoading && !error && renderPreview()}
+                {/* Close Button Header */}
+                <div className="flex justify-end p-2">
+                    <button onClick={onClose} className="p-2 text-gray-500 hover:bg-gray-100 rounded-full">
+                        <XMarkIcon className="w-6 h-6" />
+                    </button>
+                </div>
+                
+                <div className="flex-grow overflow-hidden relative">
+                    {error ? (
+                        <div className="flex flex-col items-center justify-center h-full p-4">
+                            <ExclamationTriangleIcon className="w-10 h-10 text-red-500 mb-4"/>
+                            <p className="text-red-700 text-center">{error}</p>
+                        </div>
+                    ) : (
+                        renderPreview()
+                    )}
+                </div>
             </div>
         </div>
     );
