@@ -1,4 +1,3 @@
-
 import * as React from 'react';
 // Fix: Use `import type` for User as it is used as a type, not a value. This resolves module resolution errors in some environments.
 import type { User } from '@supabase/supabase-js';
@@ -407,7 +406,7 @@ export const useSync = ({ user, localData, deletedIds, onDataSynced, onDeletions
             setStatus('synced');
         } catch (err: any) {
             let errorMessage = err.message || 'حدث خطأ غير متوقع.';
-            if (errorMessage.toLowerCase().includes('failed to fetch')) errorMessage = 'فشل الاتصال بالخادم.';
+            if (String(errorMessage).toLowerCase().includes('failed to fetch')) errorMessage = 'فشل الاتصال بالخادم.';
             else console.error("Error during sync:", err);
             
             if ((errorMessage.includes('column') && errorMessage.includes('does not exist')) || errorMessage.includes('relation')) {
@@ -416,7 +415,7 @@ export const useSync = ({ user, localData, deletedIds, onDataSynced, onDeletions
             if (err.table) errorMessage = `[جدول: ${err.table}] ${errorMessage}`;
             setStatus('error', `فشل المزامنة: ${errorMessage}`);
         }
-    }, [localData, userRef, isOnline, onDataSynced, deletedIds, onDeletionsSynced, isAuthLoading, syncStatus, locallyDeletedDocIds]);
+    }, [localData, deletedIds, userRef, isOnline, onDataSynced, isAuthLoading, syncStatus, locallyDeletedDocIds]);
 
     const fetchAndRefresh = React.useCallback(async () => {
         if (syncStatus === 'syncing' || isAuthLoading) return;

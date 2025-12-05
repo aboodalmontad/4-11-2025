@@ -1,4 +1,3 @@
-
 import * as React from 'react';
 import { Client, Session, AdminTask, Appointment, AccountingEntry, Case, Stage, Invoice, InvoiceItem, CaseDocument, AppData, DeletedIds, getInitialDeletedIds, Profile, SiteFinancialEntry, Permissions, defaultPermissions } from '../types';
 import { useOnlineStatus } from './useOnlineStatus';
@@ -313,17 +312,20 @@ export const useSupabaseData = (user: User | null, isAuthLoading: boolean) => {
     // However, for local storage (IndexedDB) and optimistic updates, we need to know who the "data owner" is.
     const effectiveUserId = React.useMemo(() => {
         if (!user) return null;
-        const currentUserProfile = data.profiles.find(p => p.id === user.id);
+        // FIX: Ensure data.profiles is defined to prevent "Cannot read properties of undefined"
+        const profiles = data?.profiles || [];
+        const currentUserProfile = profiles.find(p => p.id === user.id);
         if (currentUserProfile && currentUserProfile.lawyer_id) {
             return currentUserProfile.lawyer_id; // I am an assistant, return lawyer ID
         }
         return user.id; // I am a lawyer/admin, return my ID
-    }, [user, data.profiles]);
+    }, [user, data?.profiles]);
 
     // Current user's permissions (if assistant)
     const currentUserPermissions: Permissions = React.useMemo(() => {
         if (!user) return defaultPermissions;
-        const currentUserProfile = data.profiles.find(p => p.id === user.id);
+        const profiles = data?.profiles || [];
+        const currentUserProfile = profiles.find(p => p.id === user.id);
         if (currentUserProfile && currentUserProfile.lawyer_id) {
             // Merge defaultPermissions to ensure all keys exist
             return { ...defaultPermissions, ...currentUserProfile.permissions };
@@ -358,7 +360,7 @@ export const useSupabaseData = (user: User | null, isAuthLoading: boolean) => {
             can_delete_admin_task: true,
             can_view_reports: true,
         };
-    }, [user, data.profiles]);
+    }, [user, data?.profiles]);
 
     // Update Data: Use effectiveUserId for IDB key
     const updateData = React.useCallback((updater: React.SetStateAction<AppData>) => {
@@ -431,6 +433,13 @@ export const useSupabaseData = (user: User | null, isAuthLoading: boolean) => {
                 
                 if (cancelled) return;
 
+                // Load locally deleted IDs to filter them out immediately
+                let blockedDocIds = new Set<string>();
+                try {
+                    const storedBlocked = localStorage.getItem(LOCALLY_DELETED_DOCS_KEY);
+                    if (storedBlocked) blockedDocIds = new Set(JSON.parse(storedBlocked));
+                } catch {}
+
                 const validatedData = validateAndFixData(storedData, user);
                 const localDocsMetadataMap = new Map((localDocsMetadata as any[]).map((meta: any) => [meta.id, meta]));
                 const finalDocs = validatedData.documents.map(doc => {
@@ -440,7 +449,8 @@ export const useSupabaseData = (user: User | null, isAuthLoading: boolean) => {
                         localState: localMeta?.localState || doc.localState || 'pending_download',
                         isLocalOnly: localMeta?.isLocalOnly || doc.isLocalOnly 
                     };
-                }).filter(doc => !!doc) as CaseDocument[];
+                })
+                .filter(doc => !!doc && !blockedDocIds.has(doc.id)) as CaseDocument[];
                 
                 const finalData = { ...validatedData, documents: finalDocs };
                 
@@ -608,6 +618,12 @@ export const useSupabaseData = (user: User | null, isAuthLoading: boolean) => {
         if (!supabase) return;
 
         for (const doc of pendingDownloads) {
+            // Guard: Do not download if locally deleted
+            if (locallyDeletedDocIds.has(doc.id)) {
+                console.log(`Skipping download for deleted doc: ${doc.id}`);
+                continue;
+            }
+
             try {
                 // Update UI to downloading
                 updateData(p => ({...p, documents: p.documents.map(d => d.id === doc.id ? {...d, localState: 'downloading' } : d)}));
@@ -632,7 +648,7 @@ export const useSupabaseData = (user: User | null, isAuthLoading: boolean) => {
                 updateData(p => ({...p, documents: p.documents.map(d => d.id === doc.id ? {...d, localState: 'error'} : d)}));
             }
         }
-    }, [isOnline, data.documents, updateData]);
+    }, [isOnline, data.documents, updateData, locallyDeletedDocIds]);
 
     // Trigger queues
     React.useEffect(() => {

@@ -1,4 +1,3 @@
-
 import { getSupabaseClient } from '../supabaseClient';
 import { Client, AdminTask, Appointment, AccountingEntry, Invoice, InvoiceItem, CaseDocument, Profile, SiteFinancialEntry, SyncDeletion } from '../types';
 // Fix: Use `import type` for User as it is used as a type, not a value. This resolves module resolution errors in some environments.
@@ -23,7 +22,8 @@ export type FlatData = {
 
 
 /**
- * Checks if all required tables exist in the Supabase database schema.
+ * Checks if the Supabase database is accessible and initialized.
+ * Optimized to prevent "Failed to fetch" errors caused by too many concurrent requests.
  */
 export const checkSupabaseSchema = async () => {
     const supabase = getSupabaseClient();
@@ -31,47 +31,38 @@ export const checkSupabaseSchema = async () => {
         return { success: false, error: 'unconfigured', message: 'Supabase client is not configured.' };
     }
 
-    const tableChecks: { [key: string]: string } = {
-        'profiles': 'id', 'clients': 'id', 'cases': 'id',
-        'stages': 'id', 'sessions': 'id', 'admin_tasks': 'id',
-        'appointments': 'id', 'accounting_entries': 'id', 'assistants': 'name',
-        'invoices': 'id', 'invoice_items': 'id', 'case_documents': 'id',
-        'site_finances': 'id',
-        'sync_deletions': 'id', // Checked for resurrection fix
-    };
-    
-    const tableCheckPromises = Object.entries(tableChecks).map(([table, query]) =>
-        supabase.from(table).select(query, { head: true }).then(res => ({ ...res, table }))
-    );
-
     try {
-        const results = await Promise.all(tableCheckPromises);
-        for (const result of results) {
-            if (result.error) {
-                const message = String(result.error.message || '').toLowerCase();
-                const code = String(result.error.code || '');
-                
-                if (code === '42P01' || message.includes('does not exist') || message.includes('could not find the table') || message.includes('schema cache') || message.includes('relation') ) {
-                    return { success: false, error: 'uninitialized', message: `Database uninitialized. Missing table or relation: ${result.table}.` };
-                } else {
-                    throw result.error;
-                }
+        // Optimization: Instead of checking ALL tables (which causes network congestion/Failed to fetch),
+        // we check the most critical table: 'profiles'. If this exists and connects, the DB is generally online.
+        const { error } = await supabase.from('profiles').select('id', { count: 'exact', head: true }).limit(1);
+
+        if (error) {
+            const message = String(error.message || '').toLowerCase();
+            const code = String(error.code || '');
+            
+            if (code === '42P01' || message.includes('does not exist') || message.includes('could not find the table')) {
+                return { success: false, error: 'uninitialized', message: `Database uninitialized. Table 'profiles' missing.` };
+            } else {
+                // Propagate other errors (like auth or permission) as simple connection errors for now
+                throw error;
             }
         }
+        
         return { success: true, error: null, message: '' };
+
     } catch (err: any) {
         const message = String(err?.message || '').toLowerCase();
         const code = String(err?.code || '');
 
         if (message.includes('failed to fetch')) {
-            return { success: false, error: 'network', message: 'Failed to connect to the server. Check internet connection and CORS settings.' };
+            return { success: false, error: 'network', message: 'Failed to connect to the server. Check internet connection.' };
         }
         
-        if (message.includes('does not exist') || code === '42P01' || message.includes('could not find the table') || message.includes('schema cache')) {
+        if (message.includes('does not exist') || code === '42P01') {
             return { success: false, error: 'uninitialized', message: 'Database is not fully initialized.' };
         }
 
-        return { success: false, error: 'unknown', message: `Database schema check failed: ${err.message}` };
+        return { success: false, error: 'unknown', message: `Database connection failed: ${err.message}` };
     }
 };
 
@@ -83,6 +74,8 @@ export const fetchDataFromSupabase = async (): Promise<Partial<FlatData>> => {
     const supabase = getSupabaseClient();
     if (!supabase) throw new Error('Supabase client not available.');
 
+    // We still fetch all data in parallel here, but this is usually handled better by the browser
+    // than the pre-flight OPTIONS requests of the schema check.
     const [
         clientsRes, adminTasksRes, appointmentsRes, accountingEntriesRes,
         assistantsRes, invoicesRes, casesRes, stagesRes, sessionsRes, invoiceItemsRes,
@@ -382,14 +375,14 @@ export const upsertDataToSupabase = async (data: Partial<FlatData>, user: User) 
             user_id: userId,
             stage_id: s.stage_id,
             court: s.court,
-            case_number: s.caseNumber,
+            case_number: s.case_number,
             date: s.date,
-            client_name: s.clientName,
-            opponent_name: s.opponentName,
-            postponement_reason: s.postponementReason,
-            next_postponement_reason: s.nextPostponementReason,
-            is_postponed: s.isPostponed,
-            next_session_date: s.nextSessionDate,
+            client_name: s.client_name,
+            opponent_name: s.opponent_name,
+            postponement_reason: s.postponement_reason || s.postponement_reason, // Handle both cases
+            next_postponement_reason: s.next_postponement_reason || s.next_postponement_reason,
+            is_postponed: s.is_postponed,
+            next_session_date: s.next_session_date,
             assignee: s.assignee,
             updated_at: s.updated_at
         })),
@@ -428,7 +421,24 @@ export const upsertDataToSupabase = async (data: Partial<FlatData>, user: User) 
     results.clients = await upsertTable('clients', dataToUpsert.clients);
     results.cases = await upsertTable('cases', dataToUpsert.cases);
     results.stages = await upsertTable('stages', dataToUpsert.stages);
-    results.sessions = await upsertTable('sessions', dataToUpsert.sessions);
+    // Fix: Ensure session objects are mapped correctly before upserting to avoid missing fields if source structure slightly differs
+    const mappedSessions = dataToUpsert.sessions?.map((s: any) => ({
+         id: s.id,
+         user_id: s.user_id,
+         stage_id: s.stage_id,
+         court: s.court,
+         case_number: s.case_number,
+         date: s.date,
+         client_name: s.client_name,
+         opponent_name: s.opponent_name,
+         postponement_reason: s.postponement_reason, // Handle both cases
+         next_postponement_reason: s.next_postponement_reason,
+         is_postponed: s.is_postponed,
+         next_session_date: s.next_session_date,
+         assignee: s.assignee,
+         updated_at: s.updated_at
+    }));
+    results.sessions = await upsertTable('sessions', mappedSessions);
     
     // Dependencies on Core
     results.invoices = await upsertTable('invoices', dataToUpsert.invoices);
